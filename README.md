@@ -32,34 +32,53 @@ F_p(t) = Σ_{u≤t} S(u⁻) · d_p(u)/n(u)      # 累计预防更换率
 
 ## 2. 数据与事务保证
 
-SQLite 三张表（见 `app/db.py`）：
+SQLite 表（见 `app/db.py`）：
 
 | 表 | 内容 |
 |---|---|
 | `ledger` | 泵台账，泵号主键，含入/出册小时、结束方式、更新时间 |
-| `life_table` | 汇总：每个时点一行，逐时点计数、风险率、S、F_f、F_p |
-| `meta` | 泵总数、汇总更新时间、最近数据来源 |
+| `life_table` | 汇总基准：每个时点一行，逐时点计数、风险率、S、F_f、F_p |
+| `cif_base` | 改判过的时点的基准风险率与 S(t⁻)，供从基准精确重算修正量 |
+| `cif_delta` | 当前后缀修正量（时序号 → ΔF_f、ΔF_p），用于整表展示 |
+| `cif_tree` | 同一批修正量的 Fenwick（树状数组），供任意小时查询按 O(log M) 前缀求和 |
+| `meta` | 泵总数、时点数、汇总更新时间、最近数据来源、schema 版本 |
 
 - 上传 CSV = 整体替换台账；单泵更正 = upsert 一行。两条写路径都在
-  **一个事务**内完成「写台账 → 重算并替换汇总」，任何一步失败即
+  **一个事务**内完成「写台账 → 更新汇总 → 写辅助修正量」，任何一步失败即
   `ROLLBACK`，**保留原有台账与汇总**（`app/services.py`）。
-- 单泵更正只需提交该泵数据，服务端自行从库内加载全量台账重算，
+- 单泵更正只需提交该泵数据，服务端自行从库内加载数据重算，
   **无须读取/回传其他泵明细**。
-- 查询接口（`/query`、`/api/query`、`/api/lifetable`）只读 `life_table`
-  与 `meta`，不执行任何写操作。
+- **纯改判快路径**：入册、出册小时都不变，只在本泵的 `故障 ↔ 预防更换`
+  之间改判时，服务端只读取这一台泵的台账行，再读取该出册时点及其前一个
+  时点的汇总行；风险集 n(t) 与两类事件合计不变，所以 `S(t)` 不变，只需把
+  `S(t⁻)·(当前风险率 − 基准风险率)` 作为**常数后缀修正**记入 Fenwick 树
+  （写入 O(log M) 行）。修正量始终相对最近一次全量重算的基准值重算，
+  **改回原判据时精确复原**，不会累积浮点漂移。查询取「基准值 + 前缀和」，
+  读取 1 条汇总行与 O(log M) 条辅助记录；首页明细按 `cif_delta` 顺序叠加，
+  结果与全量重算逐位一致（浮点误差内）。
+- **全量重算去重**：整表重传或其他字段更正会先清空 `cif_delta`/`cif_tree`，
+  再以这次要保存的台账重建基准汇总；已计入的改判不会叠加到新基准上。
+- **一致性快照**：查询在 WAL 读事务（`BEGIN`…`ROLLBACK`）内读取汇总与
+  辅助数据，只会看到同一已提交状态；写路径使用 `BEGIN IMMEDIATE`。
+- **旧库直接升级**：启动时按 `PRAGMA user_version` 就地补 `life_table.seq`、
+  辅助表与 `time_point_count`，已有正常台账无须重传 CSV。
+- 查询接口（`/query`、`/api/query`、`/api/lifetable`）只读汇总与辅助表，
+  不执行任何写操作。
 
 ## 3. 目录结构
 
 ```
 app/
-  __init__.py     Flask 路由（上传、台账、更正、查询、JSON API）
+  __init__.py     Flask 路由（上传、台账、更正/改判、查询、JSON API）
   lifetable.py    生命表/CIF 纯计算与校验
   csvio.py        CSV 解析（中英文表头、三种结束方式别名、逐行报错）
-  db.py           SQLite 连接与建表
-  services.py     事务服务层（替换台账、单泵 upsert、只读查询）
+  db.py           SQLite 连接、建表与就地 schema 升级
+  services.py     事务服务层（替换台账、单泵 upsert / 增量改判、只读查询）
   templates/      4 个 Jinja 页面
   static/style.css
-tests/test_app.py 20 个 unittest 用例（数学、边界、CSV、事务回滚、网页、只读性）
+tests/test_app.py 34 个 unittest 用例（数学、边界、CSV、事务回滚、增量与
+                  全量一致性、同小时多台/改回、旧库升级、读写量对数增长、
+                  查询快照、网页、只读性）
 sample/pumps_sample.csv
 Dockerfile, docker-compose.yml, requirements.txt, wsgi.py
 ```
@@ -95,7 +114,10 @@ python wsgi.py                      # 或 gunicorn wsgi:app
 2. 首页查看逐时点计算明细表。
 3. 「故障率查询」输入任意小时（如 1500、2000），得到累计故障率、
    累计预防率、无事件概率及该结果使用的逐时点计数。
-4. 「台账」页可新增泵或对单台泵做更正，保存后汇总立即同步重算。
+4. 「台账」页可新增泵或对单台泵做更正；对「故障 / 预防更换」的泵还可点
+   **「改为预防更换 / 改为故障」**一键改判（入/出册小时不变），保存后汇总
+   立即按原口径更新，首页明细、查询页和 JSON API 同步反映。
+   改判不叠加：再次点同一按钮即改回；整表重传后按新台账重算。
 
 JSON 接口：
 
@@ -107,7 +129,7 @@ curl 'http://localhost:8000/api/lifetable'
 ## 7. 自测
 
 ```bash
-python -I -m unittest discover -s tests -v     # 20 个用例应全部 OK
+python -I -m unittest discover -s tests -v     # 34 个用例应全部 OK
 ```
 
 ## 8. 示例数据的手算基准（sample CSV，6 台泵）

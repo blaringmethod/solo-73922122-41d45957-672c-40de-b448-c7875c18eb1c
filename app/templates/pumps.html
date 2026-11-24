@@ -20,7 +20,19 @@
       <td>{{ '%.2f'|format(p.exit_hours) }}</td>
       <td>{{ event_labels[p.event_type] }}</td>
       <td>{{ p.updated_at }}</td>
-      <td><a class="btn btn-small" href="{{ url_for('pump_edit', pump_id=p.pump_id) }}">更正</a></td>
+      <td>
+        <a class="btn btn-small" href="{{ url_for('pump_edit', pump_id=p.pump_id) }}">更正</a>
+        {% if p.event_type in ('failure', 'preventive') %}
+        <form method="post" action="{{ url_for('pump_reclassify', pump_id=p.pump_id) }}" class="inline-form">
+          <input type="hidden" name="event_type"
+                 value="{{ 'preventive' if p.event_type == 'failure' else 'failure' }}">
+          <button type="submit" class="btn btn-small btn-ghost"
+                  title="入/出册小时不变，仅改判本泵出册原因；只增量更新本时点与后续累计概率">
+            改为{{ event_labels['preventive' if p.event_type == 'failure' else 'failure'] }}
+          </button>
+        </form>
+        {% endif %}
+      </td>
     </tr>
   {% endfor %}
   </tbody>

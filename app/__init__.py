@@ -39,8 +39,7 @@ def create_app(db_path: str | None = None) -> Flask:
     @app.route("/")
     def index():
         conn = db_conn()
-        meta = services.get_meta(conn)
-        table = services.get_life_table(conn)
+        meta, table = services.get_dashboard(conn)
         return render_template("index.html", meta=meta, table=table,
                                event_labels=EVENT_LABELS)
 
@@ -91,6 +90,34 @@ def create_app(db_path: str | None = None) -> Flask:
         if row is None:
             abort(404)
         return _pump_form(row)
+
+    @app.route("/pumps/<pump_id>/reclassify", methods=["POST"])
+    def pump_reclassify(pump_id: str):
+        """Flip only the exit reason between failure and preventive.
+
+        Entry/exit hours are taken from the stored ledger row unchanged, so
+        the request carries just the pump id and target reason and the
+        service can apply its logarithmic incremental correction.
+        """
+        conn = db_conn()
+        new_event = request.form.get("event_type", "").strip()
+        if new_event not in ("failure", "preventive"):
+            flash("只能在本泵的 故障 / 预防更换 之间改判出册原因", "error")
+            return redirect(url_for("pumps"))
+        try:
+            result = services.reclassify_pump(conn, pump_id, new_event)
+        except LookupError:
+            abort(404)
+        except ValueError as exc:
+            flash(f"改判未生效，原值保留: {exc}", "error")
+            return redirect(url_for("pumps"))
+        except Exception as exc:  # pragma: no cover - defensive
+            flash(f"保存失败，已保留原值: {exc}", "error")
+            return redirect(url_for("pumps"))
+        label = EVENT_LABELS[new_event]
+        flash(f"泵 {pump_id} 已改判为「{label}」（{result['action']}），"
+              "汇总已按原口径同步更新", "ok")
+        return redirect(url_for("pumps"))
 
     def _pump_form(existing):
         conn = db_conn()

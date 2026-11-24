@@ -67,3 +67,7 @@ tbody tr:nth-child(even) { background: #fafbfd; }
 .empty { color: var(--muted); }
 .hint { color: var(--muted); font-size: 13px; }
 .footer { text-align: center; color: var(--muted); font-size: 12.5px; padding: 18px; }
+.inline-form { display: inline; margin-left: 6px; }
+.btn-ghost { background: #f7f9fc; color: var(--blue-dark); border-color: #c7d3e8; }
+.btn-ghost:hover { background: #eaf0fb; }
+td.actions { white-space: nowrap; }
